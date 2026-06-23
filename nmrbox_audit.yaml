@@ -1,0 +1,12 @@
+---
+monitor:
+  - /reboxitory
+  - /usr/software
+  - /public
+  - /scratch
+  - /home/nmrbox
+store: /accountinglogs/
+audit:
+  backlog_limit: 16_384
+  wait_time_ms: 120_000
+...
