@@ -25,12 +25,13 @@ import re
 import shutil
 import subprocess
 import sys
+import yaml 
 from pathlib import Path
 
 DEFAULT_CONFIG = "/etc/nmrhub.d/nmrbox_audit.yaml"
 RULES_PATH = Path("/etc/audit/rules.d/40-nmrbox.rules")
 PLUGIN_PATH = Path("/etc/audit/plugins.d/nmrbox.conf")
-COLLECTOR_DEST = Path("/usr/local/bin/nmrbox_audit_collector.py")
+COLLECTOR_DEST = Path("/opt/nmrhub.d/nmrbox_audit_collector.py")
 COLLECTOR_SRC = Path(__file__).resolve().parent / "nmrbox_audit_collector.py"
 
 UNSET_AUID = 4294967295  # -1 as u32: login uid not set (daemons, kernel threads)
