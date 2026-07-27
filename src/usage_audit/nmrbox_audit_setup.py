@@ -51,7 +51,7 @@ def load_config(path: str) -> dict:
     return {
         "store": str(raw.get("store", "/accountinglogs/")),
         "monitor": [str(p).rstrip("/") or "/" for p in raw.get("monitor", [])],
-        "min_auid": _as_int(raw.get("min_auid"), 30001),
+        "min_auid": _as_int(raw.get("min_auid"), 1000),
         "backlog_limit": _as_int(audit.get("backlog_limit"), 16384),
         "wait_time": _as_int(audit.get("wait_time_us"), 120000),
         "failure_mode": _as_int(audit.get("failure_mode"), 1),
