@@ -178,11 +178,27 @@ def main(argv=None) -> int:
         shutil.copyfile(COLLECTOR_SRC, COLLECTOR_DEST)
         os.chmod(COLLECTOR_DEST, 0o755)
 
-    _write(RULES_PATH, build_rules(cfg), 0o640, args.dry_run)
+    # Check if rules have changed to avoid reloading unchanged rules
+    new_rules = build_rules(cfg)
+    rules_unchanged = False
+    if RULES_PATH.exists() and not args.dry_run:
+        try:
+            existing_rules = RULES_PATH.read_text(encoding="utf-8")
+            if existing_rules == new_rules:
+                rules_unchanged = True
+                print("NMRbox audit rules unchanged")
+        except Exception:
+            pass
+
+    _write(RULES_PATH, new_rules, 0o640, args.dry_run)
     _write(PLUGIN_PATH, build_plugin_conf(args.config), 0o640, args.dry_run)
 
     if args.no_restart:
         print("\n--no-restart: skipping rule load and auditd restart")
+        return 0
+
+    if rules_unchanged:
+        print("audit.rules reload skipped (rules unchanged)")
         return 0
 
     print("\nloading rules and restarting auditd")
