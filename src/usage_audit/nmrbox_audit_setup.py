@@ -11,7 +11,7 @@ What it does (idempotently):
        - one open/openat/openat2 watch per monitored path (b64 and b32),
          filtered to real NMRbox users (auid >= min_auid) so daemon/root
          activity is dropped in-kernel.
-  3. Installs the collector to /usr/local/bin and registers it as an audisp
+  3. Installs the collector to /opt/nmrbox.d and registers it as an audisp
      plugin in /etc/audit/plugins.d/nmrbox.conf.
   4. Loads the rules (augenrules --load) and restarts auditd.
 
@@ -31,7 +31,7 @@ from pathlib import Path
 DEFAULT_CONFIG = "/etc/nmrhub.d/nmrbox_audit.yaml"
 RULES_PATH = Path("/etc/audit/rules.d/40-nmrbox.rules")
 PLUGIN_PATH = Path("/etc/audit/plugins.d/nmrbox.conf")
-COLLECTOR_DEST = Path("/opt/nmrhub.d/nmrbox_audit_collector.py")
+COLLECTOR_DEST = Path("/opt/nmrbox.d/nmrbox_audit_collector.py")
 COLLECTOR_SRC = Path(__file__).resolve().parent / "nmrbox_audit_collector.py"
 
 UNSET_AUID = 4294967295  # -1 as u32: login uid not set (daemons, kernel threads)

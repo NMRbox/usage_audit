@@ -20,21 +20,15 @@ Examples
 Requires Python >= 3.12.
 """
 
-from __future__ import annotations
-
 import argparse
 import contextlib
 import lzma
 import sqlite3
 import sys
 import tempfile
+import yaml
 from datetime import datetime
 from pathlib import Path
-
-try:
-    import yaml
-except ModuleNotFoundError:
-    yaml = None
 
 DEFAULT_CONFIG = "/etc/nmrhub.d/nmrbox_audit.yaml"
 DEFAULT_STORE = "/accountinglogs/"
@@ -115,6 +109,48 @@ def query_rows(conn, *, auid, path_like, limit):
     return conn.execute(sql, params).fetchall()
 
 
+# Every column of an event (interned strings resolved back to text), joined to
+# each of its path records. Column order/names drive the --all-fields output.
+FULL = """
+SELECT e.ts, e.serial, e.auid, e.uid, e.gid, e.pid, e.ppid, e.ses, e.success,
+       sy.val  AS syscall,
+       se.val  AS exe,
+       sc.val  AS comm,
+       sk.val  AS key,
+       scw.val AS cwd,
+       sp.val  AS proctitle,
+       p.item, sn.val AS name, snt.val AS nametype,
+       p.inode, p.mode, p.ouid, p.ogid
+FROM events e
+JOIN paths  p  ON p.event_id = e.id
+LEFT JOIN strings sn  ON sn.id  = p.name_id
+LEFT JOIN strings snt ON snt.id = p.nametype_id
+LEFT JOIN strings sy  ON sy.id  = e.syscall_id
+LEFT JOIN strings se  ON se.id  = e.exe_id
+LEFT JOIN strings sc  ON sc.id  = e.comm_id
+LEFT JOIN strings sk  ON sk.id  = e.key_id
+LEFT JOIN strings scw ON scw.id = e.cwd_id
+LEFT JOIN strings sp  ON sp.id  = e.proctitle_id
+"""
+
+
+def query_full(conn, *, auid, path_like, limit):
+    where, params = [], []
+    if auid is not None:
+        where.append("e.auid = ?")
+        params.append(auid)
+    if path_like:
+        where.append("sn.val LIKE ?")
+        params.append(f"{path_like}%")
+    sql = FULL + ("WHERE " + " AND ".join(where) if where else "")
+    sql += " ORDER BY e.ts"
+    if limit:
+        sql += f" LIMIT {int(limit)}"
+    cur = conn.execute(sql, params)
+    cols = [d[0] for d in cur.description]
+    return cols, cur.fetchall()
+
+
 def run_listing(paths, args):
     n = 0
     for db in paths:
@@ -123,6 +159,25 @@ def run_listing(paths, args):
                     conn, auid=args.auid, path_like=args.path, limit=args.limit):
                 when = datetime.fromtimestamp(ts).strftime("%Y-%m-%d %H:%M:%S")
                 print(f"{when}  auid={auid}  {comm or '-'}  {path}")
+                n += 1
+    print(f"\n{n} event(s).", file=sys.stderr)
+
+
+def run_all_fields(paths, args):
+    n = 0
+    for db in paths:
+        with open_day(db) as conn:
+            cols, rows = query_full(
+                conn, auid=args.auid, path_like=args.path, limit=args.limit)
+            width = max(len(c) for c in cols)
+            for row in rows:
+                if n:
+                    print("-" * 40)
+                for col, val in zip(cols, row):
+                    if col == "ts" and val is not None:
+                        val = datetime.fromtimestamp(val).strftime(
+                            "%Y-%m-%d %H:%M:%S")
+                    print(f"{col:>{width}} = {'' if val is None else val}")
                 n += 1
     print(f"\n{n} event(s).", file=sys.stderr)
 
@@ -169,6 +224,8 @@ def main(argv=None) -> int:
                     help="show N most-opened files instead of a listing")
     ap.add_argument("--summary", action="store_true",
                     help="per-user open counts instead of a listing")
+    ap.add_argument("--all-fields", action="store_true",
+                    help="dump every event field (and path fields) per record")
     args = ap.parse_args(argv)
 
     sd = Path(args.store) if args.store else store_dir(args.config)
@@ -182,6 +239,8 @@ def main(argv=None) -> int:
         run_top(paths, args)
     elif args.summary:
         run_summary(paths, args)
+    elif args.all_fields:
+        run_all_fields(paths, args)
     else:
         run_listing(paths, args)
     return 0

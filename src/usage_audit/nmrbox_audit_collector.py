@@ -28,8 +28,6 @@ for testing or backfill.
 Requires Python >= 3.12.
 """
 
-from __future__ import annotations
-
 import argparse
 import logging
 import logging.handlers
@@ -41,14 +39,9 @@ import signal
 import sqlite3
 import sys
 import time
+import yaml
 from datetime import datetime
 from pathlib import Path
-
-try:
-    import yaml
-except ModuleNotFoundError:  # pragma: no cover
-    sys.stderr.write("PyYAML is required (apt-get install -y python3-yaml)\n")
-    raise
 
 DEFAULT_CONFIG = "/etc/nmrhub.d/nmrbox_audit.yaml"
 
