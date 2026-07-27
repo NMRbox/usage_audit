@@ -31,6 +31,7 @@ from pathlib import Path
 DEFAULT_CONFIG = "/etc/nmrhub.d/nmrbox_audit.yaml"
 RULES_PATH = Path("/etc/audit/rules.d/40-nmrbox.rules")
 PLUGIN_PATH = Path("/etc/audit/plugins.d/nmrbox.conf")
+AUDITD_CONF_PATH = Path("/etc/audit/auditd.conf")
 COLLECTOR_DEST = Path("/opt/nmrbox.d/nmrbox_audit_collector.py")
 COLLECTOR_SRC = Path(__file__).resolve().parent / "nmrbox_audit_collector.py"
 
@@ -95,6 +96,46 @@ def build_plugin_conf(config_path: str) -> str:
         "format = string\n"
         f"args = --config {config_path}\n"
     )
+
+
+def update_auditd_conf(audit_log_path: Path, dry: bool) -> None:
+    """Update /etc/audit/auditd.conf to set log_file to audit subdirectory."""
+    if not AUDITD_CONF_PATH.exists():
+        print(f"  {AUDITD_CONF_PATH} does not exist (will be created by auditd)")
+        return
+
+    try:
+        content = AUDITD_CONF_PATH.read_text(encoding="utf-8")
+    except Exception as e:
+        print(f"  warning: could not read {AUDITD_CONF_PATH}: {e}")
+        return
+
+    # Update log_file line (case-insensitive, strip whitespace)
+    lines = content.splitlines(keepends=True)
+    updated = False
+    new_lines = []
+    log_file_str = f"log_file = {audit_log_path}/audit.log"
+
+    for line in lines:
+        # Match "log_file = ..." (case-insensitive, skip comments)
+        if line.strip() and not line.strip().startswith("#"):
+            stripped = line.split("#")[0].strip()
+            if stripped.lower().startswith("log_file"):
+                new_lines.append(log_file_str + "\n")
+                updated = True
+                continue
+        new_lines.append(line)
+
+    if not updated:
+        # If no existing log_file line, append it
+        new_lines.append(log_file_str + "\n")
+        updated = True
+
+    new_content = "".join(new_lines)
+    if new_content != content:
+        _write(AUDITD_CONF_PATH, new_content, 0o640, dry)
+    else:
+        print(f"  {AUDITD_CONF_PATH} already correct")
 
 
 # --------------------------------------------------------------------------- #
@@ -165,11 +206,16 @@ def main(argv=None) -> int:
     ensure_auditd(args.dry_run)
     ensure_pyyaml_runtime(args.dry_run)
 
-    # Store directory: root-owned, not world-readable (paths can be sensitive).
-    print(f"ensure store dir {cfg['store']}")
+    # Audit log directory: <store>/audit/, root-owned, not world-readable.
+    audit_log_dir = Path(cfg["store"]) / "audit"
+    print(f"ensure audit log dir {audit_log_dir}")
     if not args.dry_run:
-        Path(cfg["store"]).mkdir(parents=True, exist_ok=True)
-        os.chmod(cfg["store"], 0o750)
+        audit_log_dir.mkdir(parents=True, exist_ok=True)
+        os.chmod(audit_log_dir, 0o750)
+
+    # Configure auditd to log to the audit subdirectory.
+    print(f"update auditd.conf log_file")
+    update_auditd_conf(audit_log_dir, args.dry_run)
 
     # Install collector.
     print(f"install collector -> {COLLECTOR_DEST}")

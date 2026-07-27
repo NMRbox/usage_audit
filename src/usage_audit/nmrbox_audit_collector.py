@@ -524,9 +524,10 @@ def main(argv=None) -> int:
     setup_logging()
     cfg = load_config(args.config)
     hostname = os.uname().nodename
-    mgr = StoreManager(Path(cfg["store"]), hostname, cfg["seal_compress"])
+    audit_log_dir = Path(cfg["store"]) 
+    mgr = StoreManager(audit_log_dir, hostname, cfg["seal_compress"])
     log.info("collector starting: store=%s seal_compress=%s",
-             cfg["store"], cfg["seal_compress"])
+             audit_log_dir, cfg["seal_compress"])
 
     if args.replay:
         with open(args.replay, "rb") as fh:
