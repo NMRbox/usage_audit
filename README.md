@@ -46,6 +46,12 @@ audit:
 `audit.failure_mode` are required; `nmrbox_audit_setup.py` raises if any is
 missing.
 
+## failure mode
+```   -f [0..2]
+              Set failure mode 0=silent 1=printk 2=panic. This option lets you determine how you want the kernel to handle critical errors. Example conditions where this mode may have an effect includes: transmission  errors
+              to userspace audit daemon, backlog limit exceeded, out of kernel memory, and rate limit exceeded. The default value is 1. Secure environments will probably want to set this to 2.
+```
+
 ## Deploy
 
 ```bash
@@ -74,6 +80,12 @@ What it does (idempotently):
        - one open/openat/openat2 watch per monitored path (b64 and b32),
          filtered to real NMRbox users (auid >= min_auid) so daemon/root
          activity is dropped in-kernel.
+       - a watch on every filesystem mounted underneath a monitored path
+         too. Audit directory watches don't cross mount points, so e.g.
+         /reboxitory's many NFS submounts (one per data snapshot) would
+         otherwise go unaudited; the mount table (/proc/mounts) is read at
+         setup time and any mount nested under a monitored path gets its
+         own watch, in addition to the configured path itself.
   3. Installs the collector to /opt/nmrbox.d and registers it as an audisp
      plugin in /etc/audit/plugins.d/nmrbox.conf.
   4. Loads the rules (augenrules --load) and restarts auditd.

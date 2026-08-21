@@ -1,5 +1,11 @@
-nmrbox-admin-audit (2-0) UNRELEASED; urgency=medium
+nmrbox-admin-audit (2-1) focal; urgency=medium
+
+  * Logging to INFO
+
+ -- Gerard Weatherby <gweatherby@uchc.edu>  Fri, 21 Aug 2026 14:11:23 -0400
+
+nmrbox-admin-audit (2-0) focal; urgency=medium
 
   * LLM generated replacement audit 
 
- -- Gerard Weatherby <gweatherby@uchc.edu>  Tue, 18 Aug 2026 11:07:12 -0400
+ -- Gerard Weatherby <gweatherby@uchc.edu>  Fri, 21 Aug 2026 14:11:10 -0400

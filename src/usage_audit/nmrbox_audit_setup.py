@@ -11,6 +11,10 @@ What it does (idempotently):
        - one open/openat/openat2 watch per monitored path (b64 and b32),
          filtered to real NMRbox users (auid >= min_auid) so daemon/root
          activity is dropped in-kernel.
+       - a watch on every filesystem mounted underneath a monitored path
+         too: audit directory watches do not cross mount points, so e.g.
+         /reboxitory's many NFS submounts each need their own watch or
+         opens inside them go unaudited.
   3. Installs the collector to /opt/nmrbox.d and registers it as an audisp
      plugin in /etc/audit/plugins.d/nmrbox.conf.
   4. Loads the rules (augenrules --load) and restarts auditd.
@@ -43,6 +47,9 @@ COLLECTOR_SRC = Path(__file__).resolve().parent / "nmrbox_audit_collector.py"
 
 UNSET_AUID = 4294967295  # -1 as u32: login uid not set (daemons, kernel threads)
 
+MOUNTS_PATH = Path("/proc/mounts")
+_MOUNT_ESCAPE_RE = re.compile(r"\\([0-7]{3})")
+
 # Matches e.g. "-a always,exclude -F msgtype=PATH" (either field order). Some
 # hardening baselines add a rule like this to cut audit log volume, which
 # silently blinds our watches: the collector needs the PATH record to learn
@@ -71,6 +78,46 @@ def load_config(path: str) -> dict:
 def _key_for(path: str) -> str:
     slug = re.sub(r"[^a-z0-9]+", "_", path.lower()).strip("_")
     return f"nmrbox_{slug}"[:60]
+
+
+def read_mount_points() -> list[str]:
+    """Return every mount point currently in the mount table."""
+    try:
+        lines = MOUNTS_PATH.read_text(encoding="utf-8").splitlines()
+    except OSError:
+        return []
+    points = []
+    for line in lines:
+        fields = line.split()
+        if len(fields) < 2:
+            continue
+        # /proc/mounts octal-escapes spaces/tabs/newlines/backslashes in paths.
+        points.append(_MOUNT_ESCAPE_RE.sub(
+            lambda m: chr(int(m.group(1), 8)), fields[1]))
+    return points
+
+
+def expand_monitor_paths(monitor: list[str], mount_points: list[str]) -> list[str]:
+    """Add a watch target for every filesystem mounted underneath each
+    monitored path.
+
+    Audit directory watches (-F dir=) do not cross mount points -- a watch
+    on /reboxitory does not see opens inside /reboxitory/data/alphafold/1.0
+    if that's a separate (e.g. NFS) mount. Without an explicit watch on each
+    nested mount, files opened there are silently unaudited.
+    """
+    expanded = []
+    seen = set()
+    for path in monitor:
+        if path not in seen:
+            expanded.append(path)
+            seen.add(path)
+        prefix = path.rstrip("/") + "/"
+        for mp in sorted(set(mount_points)):
+            if mp not in seen and mp.startswith(prefix):
+                expanded.append(mp)
+                seen.add(mp)
+    return expanded
 
 
 def build_rules(cfg: dict) -> str:
@@ -283,9 +330,17 @@ def main(argv=None) -> int:
         return uninstall(args.dry_run, args.no_restart)
 
     cfg = load_config(args.config)
+    configured_monitor = cfg["monitor"]
+    cfg["monitor"] = expand_monitor_paths(configured_monitor, read_mount_points())
+    nested_mounts = [p for p in cfg["monitor"] if p not in configured_monitor]
+
     print(f"config: {args.config}")
     print(f"  store        = {cfg['store']}")
-    print(f"  monitor      = {cfg['monitor']}")
+    print(f"  monitor      = {configured_monitor}")
+    if nested_mounts:
+        print(f"  + nested mounts watched separately ({len(nested_mounts)}):")
+        for mp in nested_mounts:
+            print(f"      {mp}")
     print(f"  min_auid     = {cfg['min_auid']}")
     print(f"  backlog_limit= {cfg['backlog_limit']}")
     print(f"  wait_time    = {cfg['wait_time']}  (~{cfg['wait_time']/1000:.0f} ms)")
