@@ -56,9 +56,22 @@ sudo auditctl -s | grep -E 'backlog|lost|wait'
 sudo auditctl -l | grep nmrbox
 ```
 
-For the cluster, push the YAML + run setup via Ansible. Per-node-type backlog
-differences (e.g. larger on login nodes) are just a different `backlog_limit`
-in that host group's YAML.
+
+## nmrbox_audit_setup.py
+
+Install and configure the NMRbox file-open audit pipeline from
+/etc/nmrhub.d/nmrbox_audit.yaml.
+
+What it does (idempotently):
+  1. Ensures auditd is installed (apt) and the store directory exists.
+  2. Writes /etc/audit/rules.d/40-nmrbox.rules:
+       - backlog limit + backlog_wait_time from the config
+       - one open/openat/openat2 watch per monitored path (b64 and b32),
+         filtered to real NMRbox users (auid >= min_auid) so daemon/root
+         activity is dropped in-kernel.
+  3. Installs the collector to /opt/nmrbox.d and registers it as an audisp
+     plugin in /etc/audit/plugins.d/nmrbox.conf.
+  4. Loads the rules (augenrules --load) and restarts auditd.
 
 ## Query
 

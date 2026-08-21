@@ -1,0 +1,17 @@
+Source: nmrbox-admin-audit
+Section: science
+Priority: optional
+Maintainer: Gerard Weatherby <gweatherby@uchc.edu>
+Rules-Requires-Root: no
+Build-Depends:
+ debhelper-compat (= 13),
+Standards-Version: 4.6.2
+Homepage: https://www.nmrbox.org
+
+Package: nmrbox-admin-audit
+Architecture: all
+Multi-Arch: foreign
+Depends: ${misc:Depends}, auditd, python3-yaml
+Description: Watch User files 
+ Watch User files 
+XB-Nmrbox-Url: https://github.com/NMRbox/usage_audit.git

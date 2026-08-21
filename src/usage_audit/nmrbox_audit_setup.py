@@ -5,7 +5,7 @@ Install and configure the NMRbox file-open audit pipeline from
 /etc/nmrhub.d/nmrbox_audit.yaml.
 
 What it does (idempotently):
-  1. Ensures auditd is installed (apt) and the store directory exists.
+  1. Ensures the store directory exists.
   2. Writes /etc/audit/rules.d/40-nmrbox.rules:
        - backlog limit + backlog_wait_time from the config
        - one open/openat/openat2 watch per monitored path (b64 and b32),
@@ -16,6 +16,11 @@ What it does (idempotently):
   4. Loads the rules (augenrules --load) and restarts auditd.
 
 Run as root. Use --dry-run to preview without changing anything.
+
+Use --uninstall to reverse the above: removes the rules file, plugin
+config, and collector, then reloads auditd. Does not remove auditd /
+audispd-plugins (installed via apt) or the log store directory.
+
 Requires Python >= 3.12.
 """
 
@@ -119,11 +124,8 @@ def _write(path: Path, content: str, mode: int, dry: bool) -> None:
 
 def ensure_auditd(dry: bool) -> None:
     if shutil.which("auditctl") and shutil.which("augenrules"):
-        print("auditd already installed")
         return
-    print("installing auditd")
-    _run(["apt-get", "update"], dry)
-    _run(["apt-get", "install", "-y", "auditd", "audispd-plugins"], dry)
+    raise ValueError("audit not installed")
 
 
 def ensure_pyyaml_runtime(dry: bool) -> None:
@@ -132,8 +134,45 @@ def ensure_pyyaml_runtime(dry: bool) -> None:
         import yaml  # noqa: F401
         print("python3-yaml available")
     except ModuleNotFoundError:
-        print("installing python3-yaml")
-        _run(["apt-get", "install", "-y", "python3-yaml"], dry)
+        raise ValueError("python3-yaml not installed")
+
+
+def _remove(path: Path, dry: bool) -> None:
+    if not path.exists():
+        print(f"  skip {path} (not present)")
+        return
+    print(f"  remove {path}")
+    if not dry:
+        path.unlink()
+
+
+def uninstall(dry: bool, no_restart: bool) -> int:
+    """Reverse the file/rule changes made by setup. Leaves apt packages alone."""
+    print("uninstalling NMRbox audit pipeline\n")
+
+    _remove(RULES_PATH, dry)
+    _remove(PLUGIN_PATH, dry)
+    _remove(COLLECTOR_DEST, dry)
+
+    collector_dir = COLLECTOR_DEST.parent
+    if collector_dir.exists() and not any(collector_dir.iterdir()):
+        print(f"  rmdir {collector_dir}")
+        if not dry:
+            collector_dir.rmdir()
+
+    if no_restart:
+        print("\n--no-restart: skipping rule reload and auditd restart")
+        return 0
+
+    print("\nreloading rules and restarting auditd")
+    _run(["augenrules", "--load"], dry)
+    rc = _run(["systemctl", "restart", "auditd"], dry)
+    if rc != 0 and not dry:
+        print("  systemctl restart failed; trying 'service auditd restart'")
+        _run(["service", "auditd", "restart"], dry)
+
+    print("\nDone.")
+    return 0
 
 
 def main(argv=None) -> int:
@@ -143,11 +182,18 @@ def main(argv=None) -> int:
                     help="show what would change, make no changes")
     ap.add_argument("--no-restart", action="store_true",
                     help="configure but do not load rules / restart auditd")
+    ap.add_argument("--uninstall", action="store_true",
+                    help="remove the rules, plugin config, and collector "
+                         "installed by a prior run, then reload auditd. "
+                         "Does not remove apt packages or the log store.")
     args = ap.parse_args(argv)
 
     if os.geteuid() != 0 and not args.dry_run:
         sys.stderr.write("must run as root (or use --dry-run)\n")
         return 1
+
+    if args.uninstall:
+        return uninstall(args.dry_run, args.no_restart)
 
     cfg = load_config(args.config)
     print(f"config: {args.config}")
