@@ -1,4 +1,6 @@
 #!/usr/bin/env python3
+from usage_audit import DEFAULT_CONFIG
+
 doc  = """nmrbox_audit_query.py
 
 Read the per-day audit databases written by nmrbox_audit_collector.py.
@@ -30,7 +32,6 @@ import yaml
 from datetime import datetime
 from pathlib import Path
 
-DEFAULT_CONFIG = "/etc/nmrhub.d/nmrbox_audit.yaml"
 DEFAULT_STORE = "/accountinglogs/"
 
 

@@ -1,1 +1,2 @@
-usage_audit /opt/nmrbox.d/usage_audit
+usage_audit /opt/nmrbox.d/
+nmrbox_audit.yaml /etc/nmrbox.d

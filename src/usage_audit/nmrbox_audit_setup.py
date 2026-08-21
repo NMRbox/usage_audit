@@ -33,7 +33,8 @@ import sys
 import yaml 
 from pathlib import Path
 
-DEFAULT_CONFIG = "/etc/nmrhub.d/nmrbox_audit.yaml"
+from usage_audit import DEFAULT_CONFIG
+
 RULES_PATH = Path("/etc/audit/rules.d/40-nmrbox.rules")
 PLUGIN_PATH = Path("/etc/audit/plugins.d/nmrbox.conf")
 AUDITD_CONF_PATH = Path("/etc/audit/auditd.conf")
@@ -42,25 +43,28 @@ COLLECTOR_SRC = Path(__file__).resolve().parent / "nmrbox_audit_collector.py"
 
 UNSET_AUID = 4294967295  # -1 as u32: login uid not set (daemons, kernel threads)
 
+# Matches e.g. "-a always,exclude -F msgtype=PATH" (either field order). Some
+# hardening baselines add a rule like this to cut audit log volume, which
+# silently blinds our watches: the collector needs the PATH record to learn
+# which file was opened.
+PATH_EXCLUDE_RE = re.compile(r"-a\s+\S*exclude\S*.*-F\s+msgtype=PATH\b", re.IGNORECASE)
 
-def _as_int(value, default):
-    try:
-        return int(str(value).replace("_", "").strip())
-    except (TypeError, ValueError):
-        return default
+
+def _as_int(value):
+    return int(str(value).replace("_", "").strip())
 
 
 def load_config(path: str) -> dict:
     with open(path, "r", encoding="utf-8") as fh:
         raw = yaml.safe_load(fh) or {}
-    audit = raw.get("audit", {}) or {}
+    audit = raw["audit"]
     return {
-        "store": str(raw.get("store", "/accountinglogs/")),
-        "monitor": [str(p).rstrip("/") or "/" for p in raw.get("monitor", [])],
-        "min_auid": _as_int(raw.get("min_auid"), 1000),
-        "backlog_limit": _as_int(audit.get("backlog_limit"), 16384),
-        "wait_time": _as_int(audit.get("wait_time_us"), 120000),
-        "failure_mode": _as_int(audit.get("failure_mode"), 1),
+        "store": str(raw["store"]),
+        "monitor": [str(p).rstrip("/") or "/" for p in raw["monitor"]],
+        "min_auid": _as_int(raw["min_auid"]),
+        "backlog_limit": _as_int(audit["backlog_limit"]),
+        "wait_time": _as_int(audit["wait_time_us"]),
+        "failure_mode": _as_int(audit["failure_mode"]),
     }
 
 
@@ -178,6 +182,48 @@ def ensure_pyyaml_runtime(dry: bool) -> None:
         raise ValueError("python3-yaml not installed")
 
 
+def find_path_exclusions() -> list[str]:
+    """Return audit rule lines (from rules.d and the currently loaded rule
+    set) that exclude msgtype=PATH. Our watches are useless without it."""
+    hits: list[str] = []
+
+    rules_dir = Path("/etc/audit/rules.d")
+    if rules_dir.is_dir():
+        for rules_file in sorted(rules_dir.glob("*.rules")):
+            if rules_file == RULES_PATH:
+                continue  # ours never excludes PATH
+            try:
+                lines = rules_file.read_text(encoding="utf-8").splitlines()
+            except OSError:
+                continue
+            for line in lines:
+                if PATH_EXCLUDE_RE.search(line):
+                    hits.append(f"{rules_file}: {line.strip()}")
+
+    if shutil.which("auditctl"):
+        result = subprocess.run(["auditctl", "-l"], capture_output=True,
+                                 text=True, check=False)
+        for line in result.stdout.splitlines():
+            if PATH_EXCLUDE_RE.search(line):
+                hits.append(f"auditctl -l: {line.strip()}")
+
+    return hits
+
+
+def ensure_path_not_excluded(dry: bool) -> None:
+    hits = find_path_exclusions()
+    if not hits:
+        print("PATH records not excluded")
+        return
+    print("  found rule(s) excluding PATH records:")
+    for hit in hits:
+        print(f"    {hit}")
+    raise ValueError(
+        "an existing audit rule excludes msgtype=PATH; NMRbox watches rely "
+        "on PATH records to capture the file name being opened. Remove the "
+        "exclude rule and re-run setup.")
+
+
 def _remove(path: Path, dry: bool) -> None:
     if not path.exists():
         print(f"  skip {path} (not present)")
@@ -251,6 +297,7 @@ def main(argv=None) -> int:
 
     ensure_auditd(args.dry_run)
     ensure_pyyaml_runtime(args.dry_run)
+    ensure_path_not_excluded(args.dry_run)
 
     # Audit log directory: <store>/audit/, root-owned, not world-readable.
     audit_log_dir = Path(cfg["store"]) / "audit"

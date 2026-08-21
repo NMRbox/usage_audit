@@ -6,7 +6,10 @@ monitor:
   - /scratch
   - /home/nmrbox
 store: /accountinglogs/
+min_auid: 30001
 audit:
   backlog_limit: 16_384
-  wait_time_ms: 120_000
+  wait_time_us: 120_000
+  failure_mode: 1
+log level: DEBUG
 ...

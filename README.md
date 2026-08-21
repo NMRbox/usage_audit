@@ -33,13 +33,18 @@ monitor:            # directories watched recursively
   - /scratch
   - /home/nmrbox
 store: /accountinglogs/   # where the daily .db / .db.xz files are written
+min_auid: 30001           # only audit auid >= this
 audit:
   backlog_limit: 16_384
   wait_time_us: 120_000   # microseconds; 120_000 = 120 ms
+  failure_mode: 1         # auditd -f mode (1 = printk/log)
 # optional:
-# min_auid: 30001         # only audit auid >= this (default 30001)
 # seal_compress: true     # LZMA-compress prior-day files (default true)
 ```
+
+`store`, `monitor`, `min_auid`, `audit.backlog_limit`, `audit.wait_time_us`, and
+`audit.failure_mode` are required; `nmrbox_audit_setup.py` raises if any is
+missing.
 
 ## Deploy
 

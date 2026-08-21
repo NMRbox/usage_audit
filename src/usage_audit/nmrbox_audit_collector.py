@@ -43,7 +43,9 @@ import yaml
 from datetime import datetime
 from pathlib import Path
 
-DEFAULT_CONFIG = "/etc/nmrhub.d/nmrbox_audit.yaml"
+# This does not run in usage_audit virtual environment
+DEFAULT_CONFIG = "/etc/nmrbox.d/nmrbox_audit.yaml"
+
 
 # --- tuning knobs -----------------------------------------------------------
 COMMIT_EVERY_ROWS = 500       # flush the insert batch after this many events
@@ -88,6 +90,7 @@ def load_config(path: str) -> dict:
         "monitor": list(raw.get("monitor", [])),
         "min_auid": _as_int(raw.get("min_auid"), 30001),
         "seal_compress": bool(raw.get("seal_compress", True)),
+        "log_level": str(raw.get("log level", "INFO")).upper(),
     }
     return cfg
 
@@ -173,6 +176,7 @@ class Event:
 
     def add(self, rtype: str, fields: dict) -> None:
         self.last_seen = time.monotonic()
+        log.debug("event %s:%s record=%s", self.ts, self.serial, rtype)
         if rtype == "SYSCALL":
             self.syscall = _text(fields, "syscall") or (
                 fields.get("syscall", ("", False))[0] or None)
@@ -210,6 +214,11 @@ class Event:
         """Return True if event should be ignored (auid=unset AND uid < 1000)."""
         return (self.auid == UNSET_AUID and
                 self.uid is not None and self.uid < SYSTEM_UID_THRESHOLD)
+
+    def __repr__(self) -> str:
+        return (f"Event(ts={self.ts}:{self.serial} syscall={self.syscall} "
+                f"key={self.key} auid={self.auid} uid={self.uid} "
+                f"comm={self.comm} paths={len(self.paths)})")
 
 
 # --------------------------------------------------------------------------- #
@@ -309,6 +318,7 @@ class DailyStore:
         self._begin()
         eid = self._next_id
         self._next_id += 1
+        log.debug("store[%s] add id=%d %r", self.day, eid, ev)
         self._ev_batch.append((
             eid, ev.ts, ev.serial, ev.auid, ev.uid, ev.gid, ev.pid, ev.ppid,
             ev.ses, ev.success,
@@ -328,6 +338,8 @@ class DailyStore:
                or (time.monotonic() - self._last_commit) >= COMMIT_EVERY_SECS)
         if not (force or due):
             return
+        log.debug("store[%s] commit: %d events, %d paths (force=%s)",
+                  self.day, len(self._ev_batch), len(self._pa_batch), force)
         if self._ev_batch:
             self.conn.executemany(
                 "INSERT INTO events VALUES "
@@ -353,6 +365,7 @@ class DailyStore:
 
     def seal(self, compress: bool) -> None:
         """Finalize a completed day: VACUUM, then optionally LZMA-compress."""
+        log.debug("store[%s] sealing (compress=%s)", self.day, compress)
         try:
             self.conn.execute("VACUUM")
         except sqlite3.Error as exc:
@@ -394,14 +407,18 @@ class StoreManager:
         day = self.day_of(ts)
         st = self._stores.get(day)
         if st is None:
+            log.debug("store_for ts=%s -> day=%s (opening new store)", ts, day)
             st = DailyStore(self.dir, day, self.hostname)
             self._stores[day] = st
             log.info("opened %s", st.path.name)
             self._seal_older_than(day)
+        else:
+            log.debug("store_for ts=%s -> day=%s (existing store)", ts, day)
         return st
 
     def _seal_older_than(self, current_day: str) -> None:
         for day in sorted(d for d in self._stores if d < current_day):
+            log.debug("sealing older store day=%s (current=%s)", day, current_day)
             st = self._stores.pop(day)
             st.seal(self.seal_compress)
 
@@ -427,10 +444,13 @@ class Pipeline:
     def feed_line(self, line: str) -> None:
         m = _HEAD_RE.match(line)
         if not m:
+            log.debug("feed_line: no match, dropping line: %.200r", line)
             return
         rtype, ts_s, serial_s, rest = m.groups()
         eid = f"{ts_s}:{serial_s}"
         if eid != self._open_id:
+            log.debug("feed_line: new event id=%s (was %s), finalizing prior",
+                      eid, self._open_id)
             self._finalize_open()
             self._open = Event(float(ts_s), int(serial_s))
             self._open_id = eid
@@ -440,23 +460,33 @@ class Pipeline:
         ev = self._open
         self._open = None
         self._open_id = None
-        if ev is None or not ev.is_open():
+        if ev is None:
+            return
+        if not ev.is_open():
+            log.debug("finalize: dropped (not open) %r", ev)
             return
         if ev.is_filtered():
+            log.debug("finalize: dropped (filtered) %r", ev)
             return
+        log.debug("finalize: persisting %r", ev)
         self.mgr.store_for(ev.ts).add(ev)
 
     def idle_flush(self) -> None:
         if self._open and (time.monotonic() - self._open.last_seen) > EVENT_IDLE_FLUSH:
+            log.debug("idle_flush: flushing stale open event id=%s", self._open_id)
             self._finalize_open()
 
     def drain(self) -> None:
+        log.debug("drain: finalizing any open event id=%s", self._open_id)
         self._finalize_open()
 
 
-def setup_logging() -> None:
+def setup_logging(level_name: str = "INFO") -> None:
     import stat
-    log.setLevel(logging.INFO)
+    level = logging.getLevelName(level_name)
+    if not isinstance(level, int):
+        level = logging.INFO
+    log.setLevel(level)
     handler: logging.Handler | None = None
     dev_log = "/dev/log"
     try:
@@ -494,11 +524,14 @@ def run(stream, mgr: StoreManager, *, is_pipe: bool) -> None:
                 continue
             chunk = os.read(fd, 1 << 16)
             if not chunk:
+                log.debug("run: EOF on stream")
                 break  # EOF
         else:
             chunk = os.read(fd, 1 << 16)
             if not chunk:
+                log.debug("run: EOF on stream")
                 break
+        log.debug("run: read %d bytes", len(chunk))
         buf += chunk
         *lines, buf = buf.split(b"\n")
         for raw in lines:
@@ -521,13 +554,13 @@ def main(argv=None) -> int:
                          "(testing / backfill)")
     args, _unknown = ap.parse_known_args(argv)
 
-    setup_logging()
     cfg = load_config(args.config)
+    setup_logging(cfg["log_level"])
     hostname = os.uname().nodename
-    audit_log_dir = Path(cfg["store"]) 
+    audit_log_dir = Path(cfg["store"])
     mgr = StoreManager(audit_log_dir, hostname, cfg["seal_compress"])
-    log.info("collector starting: store=%s seal_compress=%s",
-             audit_log_dir, cfg["seal_compress"])
+    log.info("collector starting: store=%s seal_compress=%s log_level=%s",
+             audit_log_dir, cfg["seal_compress"], cfg["log_level"])
 
     if args.replay:
         with open(args.replay, "rb") as fh:
