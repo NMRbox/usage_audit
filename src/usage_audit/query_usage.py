@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""nmrbox_audit_query.py
+doc  = """nmrbox_audit_query.py
 
 Read the per-day audit databases written by nmrbox_audit_collector.py.
 Handles both the live `nmrbox_audit_YYYY-MM-DD.db` and the sealed, LZMA-
@@ -213,7 +213,8 @@ def run_summary(paths, args):
 
 
 def main(argv=None) -> int:
-    ap = argparse.ArgumentParser(description=__doc__)
+    ap = argparse.ArgumentParser(description=doc,
+                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--config", default=DEFAULT_CONFIG)
     ap.add_argument("--store", help="override store dir from config")
     ap.add_argument("--day", help="YYYY-MM-DD (default: all available days)")

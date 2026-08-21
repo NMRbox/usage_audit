@@ -59,6 +59,10 @@ _HEX_RE = re.compile(r"\A[0-9A-Fa-f]+\Z")
 # type=SYSCALL msg=audit(1750000000.123:4567): <fields...>
 _HEAD_RE = re.compile(r"\Atype=(\S+)\s+msg=audit\(([\d.]+):(\d+)\):\s*(.*)\Z")
 
+# Filter constants
+UNSET_AUID = 4294967295  # -1 as u32: login uid not set (daemons, kernel threads)
+SYSTEM_UID_THRESHOLD = 1000
+
 log = logging.getLogger("nmrbox-audit")
 
 
@@ -201,6 +205,11 @@ class Event:
     def is_open(self) -> bool:
         """We only persist real file-open syscalls that produced a path."""
         return bool(self.paths) and self.syscall is not None
+
+    def is_filtered(self) -> bool:
+        """Return True if event should be ignored (auid=unset AND uid < 1000)."""
+        return (self.auid == UNSET_AUID and
+                self.uid is not None and self.uid < SYSTEM_UID_THRESHOLD)
 
 
 # --------------------------------------------------------------------------- #
@@ -433,6 +442,8 @@ class Pipeline:
         self._open_id = None
         if ev is None or not ev.is_open():
             return
+        if ev.is_filtered():
+            return
         self.mgr.store_for(ev.ts).add(ev)
 
     def idle_flush(self) -> None:
@@ -513,9 +524,10 @@ def main(argv=None) -> int:
     setup_logging()
     cfg = load_config(args.config)
     hostname = os.uname().nodename
-    mgr = StoreManager(Path(cfg["store"]), hostname, cfg["seal_compress"])
+    audit_log_dir = Path(cfg["store"]) 
+    mgr = StoreManager(audit_log_dir, hostname, cfg["seal_compress"])
     log.info("collector starting: store=%s seal_compress=%s",
-             cfg["store"], cfg["seal_compress"])
+             audit_log_dir, cfg["seal_compress"])
 
     if args.replay:
         with open(args.replay, "rb") as fh:
