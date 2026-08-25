@@ -1,3 +1,9 @@
+nmrbox-admin-audit (2-2) focal; urgency=medium
+
+  * ignore service uids
+
+ -- Gerard Weatherby <gweatherby@uchc.edu>  Tue, 25 Aug 2026 10:07:02 -0400
+
 nmrbox-admin-audit (2-1) focal; urgency=medium
 
   * Logging to INFO

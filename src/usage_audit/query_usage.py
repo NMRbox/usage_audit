@@ -82,10 +82,20 @@ def discover(sd: Path, day: str | None) -> list[Path]:
     return list(found.values())
 
 
+def combined_col(conn, alias: str = "e") -> str:
+    """`combined` (opens this row stands for) if the database has it.
+
+    Databases written before the collector combined repeat opens have no such
+    column; there every row is exactly one open.
+    """
+    cols = {row[1] for row in conn.execute("PRAGMA table_info(events)")}
+    return f"{alias}.combined" if "combined" in cols else "1"
+
+
 BASE = """
 SELECT e.ts, e.auid, e.uid,
        se.val AS exe, sc.val AS comm, sy.val AS syscall,
-       sn.val AS path
+       sn.val AS path, {combined} AS opens
 FROM events e
 JOIN paths  p  ON p.event_id = e.id
 LEFT JOIN strings sn ON sn.id = p.name_id
@@ -103,7 +113,8 @@ def query_rows(conn, *, auid, path_like, limit):
     if path_like:
         where.append("sn.val LIKE ?")
         params.append(f"{path_like}%")
-    sql = BASE + ("WHERE " + " AND ".join(where) if where else "")
+    sql = BASE.format(combined=combined_col(conn))
+    sql += ("WHERE " + " AND ".join(where) if where else "")
     sql += " ORDER BY e.ts"
     if limit:
         sql += f" LIMIT {int(limit)}"
@@ -120,6 +131,7 @@ SELECT e.ts, e.serial, e.auid, e.uid, e.gid, e.pid, e.ppid, e.ses, e.success,
        sk.val  AS key,
        scw.val AS cwd,
        sp.val  AS proctitle,
+       {combined} AS opens,
        p.item, sn.val AS name, snt.val AS nametype,
        p.inode, p.mode, p.ouid, p.ogid
 FROM events e
@@ -143,7 +155,8 @@ def query_full(conn, *, auid, path_like, limit):
     if path_like:
         where.append("sn.val LIKE ?")
         params.append(f"{path_like}%")
-    sql = FULL + ("WHERE " + " AND ".join(where) if where else "")
+    sql = FULL.format(combined=combined_col(conn))
+    sql += ("WHERE " + " AND ".join(where) if where else "")
     sql += " ORDER BY e.ts"
     if limit:
         sql += f" LIMIT {int(limit)}"
@@ -153,15 +166,18 @@ def query_full(conn, *, auid, path_like, limit):
 
 
 def run_listing(paths, args):
-    n = 0
+    n = opens = 0
     for db in paths:
         with open_day(db) as conn:
-            for ts, auid, uid, exe, comm, syscall, path in query_rows(
+            for ts, auid, uid, exe, comm, syscall, path, count in query_rows(
                     conn, auid=args.auid, path_like=args.path, limit=args.limit):
                 when = datetime.fromtimestamp(ts).strftime("%Y-%m-%d %H:%M:%S")
-                print(f"{when}  auid={auid}  {comm or '-'}  {path}")
+                repeats = f"  x{count}" if count and count > 1 else ""
+                print(f"{when}  auid={auid}  {comm or '-'}  {path}{repeats}")
                 n += 1
-    print(f"\n{n} event(s).", file=sys.stderr)
+                opens += count or 1
+    extra = f" ({opens} opens)" if opens != n else ""
+    print(f"\n{n} event(s){extra}.", file=sys.stderr)
 
 
 def run_all_fields(paths, args):
@@ -187,7 +203,8 @@ def run_top(paths, args):
     counts: dict[str, int] = {}
     for db in paths:
         with open_day(db) as conn:
-            sql = ("SELECT sn.val, COUNT(*) FROM paths p "
+            sql = (f"SELECT sn.val, SUM({combined_col(conn)}) FROM paths p "
+                   "JOIN events e ON e.id = p.event_id "
                    "JOIN strings sn ON sn.id = p.name_id ")
             params = []
             if args.path:
@@ -206,7 +223,8 @@ def run_summary(paths, args):
     for db in paths:
         with open_day(db) as conn:
             for auid, c in conn.execute(
-                    "SELECT auid, COUNT(*) FROM events GROUP BY auid"):
+                    f"SELECT auid, SUM({combined_col(conn, 'events')}) "
+                    "FROM events GROUP BY auid"):
                 counts[auid] = counts.get(auid, 0) + c
     print(f"{'auid':>10}  opens")
     for auid, c in sorted(counts.items(), key=lambda kv: kv[1], reverse=True):

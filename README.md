@@ -39,12 +39,38 @@ audit:
   wait_time_us: 120_000   # microseconds; 120_000 = 120 ms
   failure_mode: 1         # auditd -f mode (1 = printk/log)
 # optional:
+# ignore uids:            # accounts to skip entirely (auid or uid)
+#   - 303034
+# combine seconds: 60     # collapse repeat opens of one file into one row
 # seal_compress: true     # LZMA-compress prior-day files (default true)
 ```
 
 `store`, `monitor`, `min_auid`, `audit.backlog_limit`, `audit.wait_time_us`, and
 `audit.failure_mode` are required; `nmrbox_audit_setup.py` raises if any is
 missing.
+
+### Cutting volume
+
+Two independent knobs, and they work at different layers:
+
+`ignore uids` becomes `-F auid!=N -F uid!=N` clauses on every watch, so the
+kernel never generates the event: no backlog pressure, no audispd pipe traffic,
+no parse. Both fields are excluded so an account is skipped whether it appears
+as a login session or as a daemon identity. Re-run `nmrbox_audit_setup.py`
+after changing it — the collector also honours the list, but only as a backstop
+for `--replay` of logs captured before the rule existed. A rule holds at most 64
+`-F` clauses, capping the list at 29 entries; setup raises rather than emitting
+a rule `auditctl` would reject.
+
+`combine seconds` is collector-side, and has no kernel equivalent — audit can
+drop events by uid or path but not "the same thing again". Within the window,
+repeat opens of one path by the same user and program become a single row whose
+`events.combined` column carries the count, instead of N rows. Repeats are most
+of the volume on a busy box. The cost is that a row is held in memory until its
+window closes, so writes lag by up to that many seconds. Set `0` to store every
+open individually. `nmrbox_audit_query.py` sums `combined`, so `--top` and
+`--summary` report true open counts either way; a listing marks a combined row
+`xN`.
 
 ## failure mode
 ```   -f [0..2]
@@ -79,7 +105,8 @@ What it does (idempotently):
        - backlog limit + backlog_wait_time from the config
        - one open/openat/openat2 watch per monitored path (b64 and b32),
          filtered to real NMRbox users (auid >= min_auid) so daemon/root
-         activity is dropped in-kernel.
+         activity is dropped in-kernel, and excluding every account in
+         `ignore uids`.
        - a watch on every filesystem mounted underneath a monitored path
          too. Audit directory watches don't cross mount points, so e.g.
          /reboxitory's many NFS submounts (one per data snapshot) would

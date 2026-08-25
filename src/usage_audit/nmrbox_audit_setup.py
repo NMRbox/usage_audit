@@ -11,6 +11,8 @@ What it does (idempotently):
        - one open/openat/openat2 watch per monitored path (b64 and b32),
          filtered to real NMRbox users (auid >= min_auid) so daemon/root
          activity is dropped in-kernel.
+       - exclusions for every account in the config's `ignore uids`, also
+         applied in-kernel so those events are never generated at all.
        - a watch on every filesystem mounted underneath a monitored path
          too: audit directory watches do not cross mount points, so e.g.
          /reboxitory's many NFS submounts each need their own watch or
@@ -47,6 +49,12 @@ COLLECTOR_SRC = Path(__file__).resolve().parent / "nmrbox_audit_collector.py"
 
 UNSET_AUID = 4294967295  # -1 as u32: login uid not set (daemons, kernel threads)
 
+# The kernel caps a single audit rule at AUDIT_MAX_FIELDS (64) -F clauses. Each
+# of our rules already spends 5 (arch, dir, auid>=, auid!=unset, key) and every
+# ignored account costs 2 more (auid!= and uid!=).
+AUDIT_MAX_FIELDS = 64
+FIXED_RULE_FIELDS = 5
+
 MOUNTS_PATH = Path("/proc/mounts")
 _MOUNT_ESCAPE_RE = re.compile(r"\\([0-7]{3})")
 
@@ -69,6 +77,7 @@ def load_config(path: str) -> dict:
         "store": str(raw["store"]),
         "monitor": [str(p).rstrip("/") or "/" for p in raw["monitor"]],
         "min_auid": _as_int(raw["min_auid"]),
+        "ignore_uids": sorted({_as_int(u) for u in (raw.get("ignore uids") or [])}),
         "backlog_limit": _as_int(audit["backlog_limit"]),
         "wait_time": _as_int(audit["wait_time_us"]),
         "failure_mode": _as_int(audit["failure_mode"]),
@@ -120,6 +129,27 @@ def expand_monitor_paths(monitor: list[str], mount_points: list[str]) -> list[st
     return expanded
 
 
+def build_ignore_fields(ignore_uids: list[int]) -> str:
+    """Render the -F clauses that drop an ignored account's opens in-kernel.
+
+    Excluding here rather than in the collector means the event is never
+    generated: no backlog pressure, no audispd pipe traffic, no parse. Both
+    auid and uid are excluded so the account is ignored whether it shows up
+    as a login session or as a daemon identity (auid unset). Clauses on one
+    rule are AND-ed, so the event is dropped if either field matches.
+    """
+    if not ignore_uids:
+        return ""
+    needed = FIXED_RULE_FIELDS + 2 * len(ignore_uids)
+    if needed > AUDIT_MAX_FIELDS:
+        raise ValueError(
+            f"{len(ignore_uids)} ignored uids need {needed} rule fields, over "
+            f"the kernel's limit of {AUDIT_MAX_FIELDS}; auditctl would reject "
+            f"the rule. Drop to at most "
+            f"{(AUDIT_MAX_FIELDS - FIXED_RULE_FIELDS) // 2} entries.")
+    return "".join(f" -F auid!={uid} -F uid!={uid}" for uid in ignore_uids)
+
+
 def build_rules(cfg: dict) -> str:
     lines = [
         "# Managed by nmrbox_audit_setup.py -- edits will be overwritten.",
@@ -131,13 +161,14 @@ def build_rules(cfg: dict) -> str:
         "",
     ]
     floor = cfg["min_auid"]
+    ignored = build_ignore_fields(cfg["ignore_uids"])
     for path in cfg["monitor"]:
         key = _key_for(path)
         for arch in ("b64", "b32"):
             lines.append(
                 f"-a always,exit -F arch={arch} -S open,openat,openat2 "
-                f"-F dir={path} -F auid>={floor} -F auid!={UNSET_AUID} "
-                f"-F key={key}")
+                f"-F dir={path} -F auid>={floor} -F auid!={UNSET_AUID}"
+                f"{ignored} -F key={key}")
         lines.append("")
     return "\n".join(lines) + "\n"
 
@@ -342,6 +373,7 @@ def main(argv=None) -> int:
         for mp in nested_mounts:
             print(f"      {mp}")
     print(f"  min_auid     = {cfg['min_auid']}")
+    print(f"  ignore uids  = {cfg['ignore_uids'] or 'none'}")
     print(f"  backlog_limit= {cfg['backlog_limit']}")
     print(f"  wait_time    = {cfg['wait_time']}  (~{cfg['wait_time']/1000:.0f} ms)")
     print()

@@ -7,6 +7,9 @@ monitor:
   - /home/nmrbox
 store: /accountinglogs/
 min_auid: 30001
+combine seconds: 60
+ignore uids:
+  - 303034
 audit:
   backlog_limit: 16_384
   wait_time_us: 120_000

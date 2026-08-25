@@ -8,7 +8,14 @@ the configured store directory.
 
 Compression strategy
 --------------------
-Two layers, both pure stdlib:
+Three layers, all pure stdlib:
+
+0. Combining: audit's dominant volume is the same file being reopened over and
+   over -- a shared library loaded by every process start, a data file read in
+   a loop. Within `combine seconds` of the first open, repeat opens of the same
+   path by the same user and program are collapsed into one row carrying a
+   `combined` count instead of N rows. Set `combine seconds: 0` to store every
+   open individually.
 
 1. In-DB normalization ("interning"): every repeated string -- exe, comm,
    syscall, key, path name, nametype, hostname -- is stored once in a `strings`
@@ -40,7 +47,7 @@ import sqlite3
 import sys
 import time
 import yaml
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 
 # This does not run in usage_audit virtual environment
@@ -89,6 +96,10 @@ def load_config(path: str) -> dict:
         "store": store,
         "monitor": list(raw.get("monitor", [])),
         "min_auid": _as_int(raw.get("min_auid"), 30001),
+        "combine_seconds": _as_int(raw.get("combine seconds"), 0),
+        "ignore_uids": frozenset(
+            u for u in (_as_int(x) for x in (raw.get("ignore uids") or []))
+            if u is not None),
         "seal_compress": bool(raw.get("seal_compress", True)),
         "log_level": str(raw.get("log level", "INFO")).upper(),
     }
@@ -210,10 +221,19 @@ class Event:
         """We only persist real file-open syscalls that produced a path."""
         return bool(self.paths) and self.syscall is not None
 
-    def is_filtered(self) -> bool:
-        """Return True if event should be ignored (auid=unset AND uid < 1000)."""
-        return (self.auid == UNSET_AUID and
-                self.uid is not None and self.uid < SYSTEM_UID_THRESHOLD)
+    def is_filtered(self, ignore_uids: frozenset = frozenset()) -> bool:
+        """Return True if event should be ignored.
+
+        Two cases: daemon/kernel activity (auid unset and a system uid), and
+        accounts listed under `ignore uids` in the config. The audit rules
+        already drop the latter in-kernel; repeating the check here costs a
+        set lookup and keeps --replay correct against logs captured before
+        the rule existed.
+        """
+        if (self.auid == UNSET_AUID and
+                self.uid is not None and self.uid < SYSTEM_UID_THRESHOLD):
+            return True
+        return self.auid in ignore_uids or self.uid in ignore_uids
 
     def __repr__(self) -> str:
         return (f"Event(ts={self.ts}:{self.serial} syscall={self.syscall} "
@@ -248,7 +268,10 @@ CREATE TABLE IF NOT EXISTS events (
     comm_id      INTEGER,
     key_id       INTEGER,
     cwd_id       INTEGER,
-    proctitle_id INTEGER
+    proctitle_id INTEGER,
+    -- How many opens this row stands for: 1 unless the combine window
+    -- collapsed repeats of the same path by the same user and program.
+    combined  INTEGER NOT NULL DEFAULT 1
 );
 CREATE TABLE IF NOT EXISTS paths (
     event_id    INTEGER NOT NULL,
@@ -273,6 +296,7 @@ class DailyStore:
         self.conn = sqlite3.connect(self.path, isolation_level=None, timeout=30)
         self._pragmas()
         self.conn.executescript(SCHEMA)
+        self._migrate()
         self.conn.execute(
             "INSERT OR IGNORE INTO meta(k, v) VALUES ('created', ?)",
             (datetime.now().isoformat(timespec="seconds"),))
@@ -288,6 +312,15 @@ class DailyStore:
         self._pa_batch: list[tuple] = []
         self._in_txn = False
         self._last_commit = time.monotonic()
+
+    def _migrate(self) -> None:
+        """CREATE TABLE IF NOT EXISTS leaves an existing day's file alone, so
+        add columns introduced after it was created."""
+        cols = {row[1] for row in self.conn.execute("PRAGMA table_info(events)")}
+        if "combined" not in cols:
+            log.info("adding events.combined to %s", self.path.name)
+            self.conn.execute("ALTER TABLE events "
+                              "ADD COLUMN combined INTEGER NOT NULL DEFAULT 1")
 
     def _pragmas(self) -> None:
         c = self.conn
@@ -314,17 +347,19 @@ class DailyStore:
         self._strcache[val] = sid
         return sid
 
-    def add(self, ev: Event) -> None:
+    def add(self, ev: Event, combined: int = 1) -> None:
         self._begin()
         eid = self._next_id
         self._next_id += 1
-        log.debug("store[%s] add id=%d %r", self.day, eid, ev)
+        log.debug("store[%s] add id=%d combined=%d %r", self.day, eid,
+                  combined, ev)
         self._ev_batch.append((
             eid, ev.ts, ev.serial, ev.auid, ev.uid, ev.gid, ev.pid, ev.ppid,
             ev.ses, ev.success,
             self._intern(ev.syscall), self._intern(ev.exe),
             self._intern(ev.comm), self._intern(ev.key),
             self._intern(ev.cwd), self._intern(ev.proctitle),
+            combined,
         ))
         for p in ev.paths:
             self._pa_batch.append((
@@ -343,7 +378,7 @@ class DailyStore:
         if self._ev_batch:
             self.conn.executemany(
                 "INSERT INTO events VALUES "
-                "(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)", self._ev_batch)
+                "(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)", self._ev_batch)
             self._ev_batch.clear()
         if self._pa_batch:
             self.conn.executemany(
@@ -432,12 +467,94 @@ class StoreManager:
         self._stores.clear()
 
 
+def _next_local_midnight(ts: float) -> float:
+    """Epoch seconds of the start of the day after the one containing ts."""
+    midnight = datetime.fromtimestamp(ts).replace(
+        hour=0, minute=0, second=0, microsecond=0)
+    return (midnight + timedelta(days=1)).timestamp()
+
+
+class Combiner:
+    """Collapses repeat opens of the same file into one row with a count.
+
+    The first open of a (user, program, path) starts a window; opens of the
+    same triple within `window` seconds only bump its counter. When the window
+    closes the event is stored once with the total. This is the one reduction
+    the kernel cannot do for us -- audit rules can drop events by uid or path,
+    but not "the same thing again" -- and on a busy box repeats are most of
+    the volume.
+
+    Cost is a held Event per distinct triple seen in the window, and up to
+    `window` seconds of write delay. window <= 0 stores every open as it
+    arrives.
+
+    Windows are measured in audit event time, not wall clock, so --replay of a
+    saved log combines exactly as the live run would have and does not hoard
+    the whole log in memory.
+    """
+
+    def __init__(self, mgr: StoreManager, window: int):
+        self.mgr = mgr
+        self.window = window
+        # key -> [event, count, expiry]. Every entry gets the same window and
+        # audit timestamps advance, so insertion order is expiry order and
+        # sweep() can stop at the first unexpired entry instead of scanning the
+        # whole dict. An out-of-order timestamp only delays that entry's flush
+        # until the head expires; drain() forces the rest out regardless.
+        self._pending: dict[tuple, list] = {}
+        self._day_end = 0.0
+        self.clock = 0.0        # latest event timestamp seen
+        self.combined_away = 0  # repeats never written, for the shutdown log
+
+    @staticmethod
+    def _key(ev: Event) -> tuple:
+        # pid is deliberately absent: collapsing across the processes of one
+        # program is the point. exe/comm are present so two different programs
+        # touching one file stay distinguishable.
+        return (ev.auid, ev.uid, ev.exe, ev.comm,
+                tuple(p["name"] for p in ev.paths))
+
+    def add(self, ev: Event) -> None:
+        if self.window <= 0:
+            self.mgr.store_for(ev.ts).add(ev)
+            return
+        self.clock = max(self.clock, ev.ts)
+        # Flush before the date advances: store_for() seals the previous day
+        # once a new day's store opens, and a held event must land first.
+        if ev.ts >= self._day_end:
+            self.sweep(force=True)
+            self._day_end = _next_local_midnight(ev.ts)
+        key = self._key(ev)
+        slot = self._pending.get(key)
+        if slot is None:
+            self._pending[key] = [ev, 1, ev.ts + self.window]
+        else:
+            slot[1] += 1
+            self.combined_away += 1
+        self.sweep(self.clock)
+
+    def sweep(self, now: float = 0.0, force: bool = False) -> None:
+        """Write out every window that closed at or before `now`."""
+        while self._pending:
+            key = next(iter(self._pending))
+            ev, count, expiry = self._pending[key]
+            if not force and expiry > now:
+                break
+            del self._pending[key]
+            log.debug("combine: flushing %r as %d open(s)", ev, count)
+            self.mgr.store_for(ev.ts).add(ev, count)
+
+
 # --------------------------------------------------------------------------- #
 # Main loop
 # --------------------------------------------------------------------------- #
 class Pipeline:
-    def __init__(self, mgr: StoreManager):
+    def __init__(self, mgr: StoreManager, combine_seconds: int = 0,
+                 ignore_uids: frozenset = frozenset(), live: bool = True):
         self.mgr = mgr
+        self.comb = Combiner(mgr, combine_seconds)
+        self.ignore_uids = ignore_uids
+        self.live = live
         self._open: Event | None = None
         self._open_id: str | None = None
 
@@ -465,20 +582,27 @@ class Pipeline:
         if not ev.is_open():
             log.debug("finalize: dropped (not open) %r", ev)
             return
-        if ev.is_filtered():
+        if ev.is_filtered(self.ignore_uids):
             log.debug("finalize: dropped (filtered) %r", ev)
             return
         log.debug("finalize: persisting %r", ev)
-        self.mgr.store_for(ev.ts).add(ev)
+        self.comb.add(ev)
 
     def idle_flush(self) -> None:
         if self._open and (time.monotonic() - self._open.last_seen) > EVENT_IDLE_FLUSH:
             log.debug("idle_flush: flushing stale open event id=%s", self._open_id)
             self._finalize_open()
+        # A live stream's timestamps track wall clock, so an idle gap still
+        # closes windows. Replaying a saved log advances only with its events.
+        self.comb.sweep(time.time() if self.live else self.comb.clock)
 
     def drain(self) -> None:
         log.debug("drain: finalizing any open event id=%s", self._open_id)
         self._finalize_open()
+        self.comb.sweep(force=True)
+        if self.comb.window > 0:
+            log.info("combining suppressed %d repeat open(s)",
+                     self.comb.combined_away)
 
 
 def setup_logging(level_name: str = "INFO") -> None:
@@ -504,8 +628,9 @@ def setup_logging(level_name: str = "INFO") -> None:
     log.addHandler(handler)
 
 
-def run(stream, mgr: StoreManager, *, is_pipe: bool) -> None:
-    pipe = Pipeline(mgr)
+def run(stream, mgr: StoreManager, *, is_pipe: bool,
+        combine_seconds: int = 0, ignore_uids: frozenset = frozenset()) -> None:
+    pipe = Pipeline(mgr, combine_seconds, ignore_uids, live=is_pipe)
     stop = {"flag": False}
 
     def _sig(_signum, _frame):
@@ -559,14 +684,18 @@ def main(argv=None) -> int:
     hostname = os.uname().nodename
     audit_log_dir = Path(cfg["store"])
     mgr = StoreManager(audit_log_dir, hostname, cfg["seal_compress"])
-    log.info("collector starting: store=%s seal_compress=%s log_level=%s",
-             audit_log_dir, cfg["seal_compress"], cfg["log_level"])
+    log.info("collector starting: store=%s seal_compress=%s combine=%ss "
+             "ignore_uids=%s log_level=%s",
+             audit_log_dir, cfg["seal_compress"], cfg["combine_seconds"],
+             sorted(cfg["ignore_uids"]) or "none", cfg["log_level"])
 
+    opts = {"combine_seconds": cfg["combine_seconds"],
+            "ignore_uids": cfg["ignore_uids"]}
     if args.replay:
         with open(args.replay, "rb") as fh:
-            run(fh, mgr, is_pipe=False)
+            run(fh, mgr, is_pipe=False, **opts)
     else:
-        run(sys.stdin, mgr, is_pipe=True)
+        run(sys.stdin, mgr, is_pipe=True, **opts)
     log.info("collector stopped")
     return 0
 
