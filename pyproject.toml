@@ -21,9 +21,13 @@ where = ["src"]  # Specify the "src" directory to look for packages
 [project.scripts]
 setup_nmrbox_audit = "usage_audit.nmrbox_audit_setup:main"
 query_usage = "usage_audit.query_usage:main"
+mapper = "usage_audit.python_mapper:main"
 
 [project.optional-dependencies] 
 # test = ['pytest']
+loader = ['keyrings.efile',
+	'postgresql_access',
+	'psycopg']
 
 [build-system]
 requires = ["setuptools"]
