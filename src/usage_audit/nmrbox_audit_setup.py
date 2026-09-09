@@ -103,10 +103,10 @@ def load_config(path: str) -> dict:
 
 
 def fetch_python_map(url: str) -> dict[str, str]:
-    """GET {"data": {module: import_name, ...}, "type": "success"} from url."""
+    """GET {module: import_name, ...} from url."""
     response = requests.get(url, timeout=30)
     response.raise_for_status()
-    return response.json()["data"]
+    return response.json()
 
 
 def is_top_level_package(init_file: str, import_name: str) -> bool:

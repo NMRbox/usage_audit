@@ -24,5 +24,5 @@ audit:
   wait_time_us: 120_000
   failure_mode: 1
 log level: INFO
-python map url: https://services.nmrbox.org/system/python_map
+python map url: https://api.nmrhub.org/admin/python-map 
 ...
