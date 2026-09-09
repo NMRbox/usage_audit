@@ -1,4 +1,11 @@
 #!/usr/bin/env python3
+#!/usr/bin/env -S uv run --script
+# /// script
+# dependencies = [
+#   "requests",
+#   "pyyaml",
+# ]
+# ///
 """nmrbox_audit_setup.py
 
 Install and configure the NMRbox file-open audit pipeline from
@@ -17,6 +24,10 @@ What it does (idempotently):
          too: audit directory watches do not cross mount points, so e.g.
          /reboxitory's many NFS submounts each need their own watch or
          opens inside them go unaudited.
+       - a -F path= watch per Python package __init__.py located by plocate,
+         minus the copies that are redundant (already inside a monitored
+         subtree), unwanted (under an `exclude paths` prefix), or unloadable
+         (parent directory gone). See filter_python_watches.
   3. Installs the collector to /opt/nmrbox.d and registers it as an audisp
      plugin in /etc/audit/plugins.d/nmrbox.conf.
   4. Loads the rules (augenrules --load) and restarts auditd.
@@ -36,7 +47,8 @@ import re
 import shutil
 import subprocess
 import sys
-import yaml 
+import requests
+import yaml
 from pathlib import Path
 
 from usage_audit import DEFAULT_CONFIG
@@ -54,6 +66,9 @@ UNSET_AUID = 4294967295  # -1 as u32: login uid not set (daemons, kernel threads
 # ignored account costs 2 more (auid!= and uid!=).
 AUDIT_MAX_FIELDS = 64
 FIXED_RULE_FIELDS = 5
+
+# Sample paths shown per drop reason when reporting the watch filter.
+EXAMPLES_PER_REASON = 3
 
 MOUNTS_PATH = Path("/proc/mounts")
 _MOUNT_ESCAPE_RE = re.compile(r"\\([0-7]{3})")
@@ -78,10 +93,160 @@ def load_config(path: str) -> dict:
         "monitor": [str(p).rstrip("/") or "/" for p in raw["monitor"]],
         "min_auid": _as_int(raw["min_auid"]),
         "ignore_uids": sorted({_as_int(u) for u in (raw.get("ignore uids") or [])}),
+        "exclude_paths": [str(p).rstrip("/")
+                          for p in (raw.get("exclude paths") or [])],
         "backlog_limit": _as_int(audit["backlog_limit"]),
         "wait_time": _as_int(audit["wait_time_us"]),
         "failure_mode": _as_int(audit["failure_mode"]),
+        "python_map_url": str(raw["python map url"]),
     }
+
+
+def fetch_python_map(url: str) -> dict[str, str]:
+    """GET {"data": {module: import_name, ...}, "type": "success"} from url."""
+    response = requests.get(url, timeout=30)
+    response.raise_for_status()
+    return response.json()["data"]
+
+
+def is_top_level_package(init_file: str, import_name: str) -> bool:
+    """True if init_file is the __init__.py of a top-level `import_name`.
+
+    plocate matches a substring of the whole path, so querying
+    "numpy/__init__.py" also returns:
+
+      numpy/__init__.pyi                    type stubs -- the query is a
+                                            prefix of the .pyi name
+      uncertainties/unumpy/__init__.py      directory merely *ends* in numpy
+      pandas/compat/numpy/__init__.py       a nested subpackage
+      sklearn/externals/_scipy/__init__.py  a vendored copy
+
+    Attributing those to the mapped package inflates precisely the popular
+    ones: every pandas import would score as numpy usage, every sklearn
+    import as scipy. Two conditions make a hit genuine -- the path really
+    ends in <import_name>/__init__.py, and the directory holding
+    <import_name> is not itself a package, so <import_name> is what gets
+    imported rather than a submodule of something else.
+
+    An unreadable parent falls through to True, keeping the watch: better a
+    watch we did not need than a silently unmonitored package.
+    """
+    path = Path(init_file)
+    if path.name != "__init__.py" or path.parent.name != import_name:
+        return False
+    return not (path.parent.parent / "__init__.py").exists()
+
+
+def resolve_python_watches(python_map: dict[str, str]) -> list[tuple[str, str]]:
+    """Look up each import's __init__.py in the plocate database and return
+    (init file, audit key) pairs.
+
+    Monitored packages live inside NMRbox users' own venvs, not this script's
+    environment, so the system-wide plocate database is searched instead of
+    importing each package -- this also picks up every user's separate copy
+    of a package, not just one. Hits are narrowed to real top-level packages
+    by is_top_level_package.
+
+    Installed packages vary from host to host, so a module with no match is
+    normal and simply noted; the rest of the modules must still get their
+    watches.
+    """
+    watches = []
+    for module, import_name in python_map.items():
+        result = subprocess.run(
+            ["plocate", "-0", f"{import_name}/__init__.py"],
+            capture_output=True, text=True, check=False)
+        hits = [p for p in result.stdout.split("\0") if p]
+        init_files = [p for p in hits
+                      if is_top_level_package(p, import_name)]
+        if len(init_files) != len(hits):
+            print(f"  {module}: ignored {len(hits) - len(init_files)} nested "
+                  f"or non-package plocate hit(s)")
+        if not init_files:
+            print(f"  note: {import_name} not installed on this host "
+                  f"(module {module!r})")
+            continue
+        key = f"nmrbox_{module}"
+        watches.extend((init_file, key) for init_file in init_files)
+    return watches
+
+
+def _device_of(path: Path) -> int | None:
+    """st_dev of path, or None if it cannot be stat'ed."""
+    try:
+        return path.stat().st_dev
+    except OSError:
+        return None
+
+
+def filter_python_watches(
+        watches: list[tuple[str, str]], monitor: list[str],
+        exclude_paths: list[str]) -> tuple[list[tuple[str, str]],
+                                           dict[str, list[str]]]:
+    """Drop watches that are redundant, unwanted, or would break the rule load.
+
+    plocate indexes the whole filesystem, so resolve_python_watches() returns
+    every copy of a package on the box: package build trees, IDE caches, and
+    files that already sit inside a monitored subtree. Each one costs rule
+    load time and an fsnotify mark on its parent directory, and the redundant
+    ones also make `key=` ambiguous -- the -F dir= rule and the -F path= rule
+    both match the same open, so which key lands is not something we control.
+
+    Four reasons to drop a watch:
+      - it is under an `exclude paths` prefix (build trees, caches);
+      - it is already inside a monitored -F dir= subtree *on the same
+        filesystem* (see below);
+      - its parent directory is gone, so auditctl would reject the rule and
+        abort every rule after it in the file. Note this stats the *parent*,
+        not the file: audit watches attach to the parent directory, so a
+        missing __init__.py still loads and arms itself if the package is
+        later (re)installed;
+      - a duplicate of a path already emitted, which would otherwise produce
+        two rules for one file under different keys.
+
+    Coverage is a device comparison, not a string prefix. A -F dir= rule does
+    not cross mount points, so /reboxitory's rule does not see a package on
+    the /reboxitory/2026/05 submount -- dropping that path as "covered" on
+    the strength of its prefix would leave it watched by nothing at all. A
+    path counts as covered only when some monitored directory both prefixes
+    it and sits on the same filesystem, which is exactly when that directory's
+    rule can reach it. (Two mounts of one filesystem share an st_dev, so a
+    bind mount can still read as covered; the expanded monitor list normally
+    carries its own rule for such a mount anyway.)
+
+    Returns (kept, dropped) where dropped maps each reason to its paths.
+    """
+    excluded = tuple(p.rstrip("/") + "/" for p in exclude_paths)
+    # A monitored directory we cannot stat covers nothing: keep the watch
+    # rather than assume a rule we cannot verify will reach the file.
+    covered = [(p.rstrip("/") + "/", dev) for p, dev in
+               ((p, _device_of(Path(p))) for p in monitor) if dev is not None]
+    kept: list[tuple[str, str]] = []
+    dropped: dict[str, list[str]] = {
+        "duplicate of an earlier watch": [],
+        "under an exclude paths prefix": [],
+        "already inside a monitored subtree": [],
+        "parent directory missing": [],
+    }
+    seen: set[str] = set()
+    for path, key in watches:
+        if path in seen:
+            dropped["duplicate of an earlier watch"].append(path)
+            continue
+        seen.add(path)
+        if path.startswith(excluded):
+            dropped["under an exclude paths prefix"].append(path)
+            continue
+        parent = Path(path).parent
+        parent_dev = _device_of(parent) if parent.is_dir() else None
+        if parent_dev is None:
+            dropped["parent directory missing"].append(path)
+        elif any(path.startswith(prefix) and parent_dev == dev
+                 for prefix, dev in covered):
+            dropped["already inside a monitored subtree"].append(path)
+        else:
+            kept.append((path, key))
+    return kept, dropped
 
 
 def _key_for(path: str) -> str:
@@ -168,6 +333,13 @@ def build_rules(cfg: dict) -> str:
             lines.append(
                 f"-a always,exit -F arch={arch} -S open,openat,openat2 "
                 f"-F dir={path} -F auid>={floor} -F auid!={UNSET_AUID}"
+                f"{ignored} -F key={key}")
+        lines.append("")
+    for path, key in cfg["python_watches"]:
+        for arch in ("b64", "b32"):
+            lines.append(
+                f"-a always,exit -F arch={arch} -S open,openat,openat2 "
+                f"-F path={path} -F auid>={floor} -F auid!={UNSET_AUID}"
                 f"{ignored} -F key={key}")
         lines.append("")
     return "\n".join(lines) + "\n"
@@ -365,9 +537,28 @@ def main(argv=None) -> int:
     cfg["monitor"] = expand_monitor_paths(configured_monitor, read_mount_points())
     nested_mounts = [p for p in cfg["monitor"] if p not in configured_monitor]
 
+    python_map = fetch_python_map(cfg["python_map_url"])
+    found = resolve_python_watches(python_map)
+    cfg["python_watches"], dropped = filter_python_watches(
+        found, cfg["monitor"], cfg["exclude_paths"])
+
     print(f"config: {args.config}")
     print(f"  store        = {cfg['store']}")
     print(f"  monitor      = {configured_monitor}")
+    print(f"  python_map   = {cfg['python_map_url']} "
+          f"({len(cfg['python_watches'])} watches / {len(python_map)} modules)")
+    if len(cfg["python_watches"]) != len(found):
+        print(f"  + filtered {len(found)} plocate hits down to "
+              f"{len(cfg['python_watches'])} watches:")
+        for reason, paths in dropped.items():
+            if not paths:
+                continue
+            print(f"      {len(paths):>6} {reason}")
+            for example in paths[:EXAMPLES_PER_REASON]:
+                print(f"             e.g. {example}")
+            if len(paths) > EXAMPLES_PER_REASON:
+                print(f"             ... and "
+                      f"{len(paths) - EXAMPLES_PER_REASON} more")
     if nested_mounts:
         print(f"  + nested mounts watched separately ({len(nested_mounts)}):")
         for mp in nested_mounts:

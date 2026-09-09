@@ -3,7 +3,7 @@ name = "usage_audit"
 description = "TBD"
 license = {text = "MIT" }
 version = "1.0"
-dependencies = ['pyyaml']
+dependencies = ['pyyaml', 'requests']
 requires-python= ">= 3.12"
 readme = "README.md"
 authors = [

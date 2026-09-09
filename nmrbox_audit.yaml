@@ -10,9 +10,19 @@ min_auid: 30001
 combine seconds: 60
 ignore uids:
   - 303034
+# plocate finds every copy of a package on the box. These trees hold build
+# staging areas and IDE caches -- copies nobody executes -- so watching them
+# costs rule load time and fsnotify marks for opens that will never happen.
+exclude paths:
+  - /download_temp
+  - /Ubuntu-24.04
+  - /Ubuntu-20.04
+  - /opt/.Trash-16342
+  - /opt/jetbrains
 audit:
   backlog_limit: 16_384
   wait_time_us: 120_000
   failure_mode: 1
-log level: INFO 
+log level: INFO
+python map url: https://services.nmrbox.org/system/python_map
 ...
