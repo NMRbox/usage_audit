@@ -34,6 +34,14 @@ from pathlib import Path
 
 DEFAULT_STORE = "/accountinglogs/"
 
+XZ_MAGIC = b"\xfd7zXZ\x00"
+
+
+def is_xz(path: Path) -> bool:
+    """True if `path` is XZ-compressed, checked by magic bytes (not name)."""
+    with open(path, "rb") as fh:
+        return fh.read(len(XZ_MAGIC)) == XZ_MAGIC
+
 
 def store_dir(config_path: str) -> Path:
     if yaml is not None:
@@ -47,7 +55,7 @@ def store_dir(config_path: str) -> Path:
 @contextlib.contextmanager
 def open_day(path: Path):
     """Yield a read-only sqlite3 connection for a .db or .db.xz file."""
-    if path.suffix == ".xz":
+    if is_xz(path):
         with tempfile.NamedTemporaryFile(suffix=".db") as tmp:
             with lzma.open(path, "rb") as src:
                 while chunk := src.read(1 << 20):
@@ -246,14 +254,17 @@ def main(argv=None) -> int:
                     help="per-user open counts instead of a listing")
     ap.add_argument("--all-fields", action="store_true",
                     help="dump every event field (and path fields) per record")
+    ap.add_argument("--db",action='append',help="Read these sqlite databases (don't do path search")
     args = ap.parse_args(argv)
 
     sd = Path(args.store) if args.store else store_dir(args.config)
-    paths = discover(sd, args.day)
-    if not paths:
-        print(f"no audit databases found in {sd}"
-              + (f" for {args.day}" if args.day else ""), file=sys.stderr)
-        return 1
+    if args.db is not None:
+        paths = [Path(p) for p in args.db]
+    else:
+        paths = discover(sd, args.day)
+        if not paths:
+            print(f"no audit databases found in {sd}" + (f" for {args.day}" if args.day else ""), file=sys.stderr)
+            return 1
 
     if args.top:
         run_top(paths, args)
