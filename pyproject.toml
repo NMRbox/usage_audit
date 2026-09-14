@@ -3,7 +3,7 @@ name = "usage_audit"
 description = "TBD"
 license = {text = "MIT" }
 version = "1.0"
-dependencies = ['pyyaml', 'requests']
+dependencies = ['plocate','pyyaml', 'requests']
 requires-python= ">= 3.12"
 readme = "README.md"
 authors = [
@@ -19,7 +19,7 @@ where = ["src"]  # Specify the "src" directory to look for packages
 
 
 [project.scripts]
-setup_nmrbox_audit = "usage_audit.nmrbox_audit_setup:main"
+setup_nmrbox_audit = "usage_audit.audit_setup:main"
 query_usage = "usage_audit.query_usage:main"
 mapper = "usage_audit.python_mapper:main"
 

@@ -90,7 +90,8 @@ def load_config(path: str) -> dict:
     audit = raw["audit"]
     return {
         "store": str(raw["store"]),
-        "monitor": [str(p).rstrip("/") or "/" for p in raw["monitor"]],
+        "monitor_dir": [str(p).rstrip("/") or "/" for p in raw["monitor directories"]],
+        "monitor_file": [str(p) for p in (raw.get("monitor files") or [])],
         "min_auid": _as_int(raw["min_auid"]),
         "ignore_uids": sorted({_as_int(u) for u in (raw.get("ignore uids") or [])}),
         "exclude_paths": [str(p).rstrip("/")
@@ -102,7 +103,7 @@ def load_config(path: str) -> dict:
     }
 
 
-def fetch_python_map(url: str) -> dict[str, str]:
+def fetch_python_map(url: str) -> list[dict]:
     """GET {module: import_name, ...} from url."""
     response = requests.get(url, timeout=30)
     response.raise_for_status()
@@ -137,7 +138,7 @@ def is_top_level_package(init_file: str, import_name: str) -> bool:
     return not (path.parent.parent / "__init__.py").exists()
 
 
-def resolve_python_watches(python_map: dict[str, str]) -> list[tuple[str, str]]:
+def resolve_python_watches(python_map: list[dict]) -> list[tuple[str, str]]:
     """Look up each import's __init__.py in the plocate database and return
     (init file, audit key) pairs.
 
@@ -152,10 +153,12 @@ def resolve_python_watches(python_map: dict[str, str]) -> list[tuple[str, str]]:
     watches.
     """
     watches = []
-    for module, import_name in python_map.items():
+    for entry in python_map:
+        module = entry['module']
+        import_name = entry['import_name']
         result = subprocess.run(
-            ["plocate", "-0", f"{import_name}/__init__.py"],
-            capture_output=True, text=True, check=False)
+        ["plocate", "-0", f"{import_name}/__init__.py"],
+        capture_output=True, text=True, check=False)
         hits = [p for p in result.stdout.split("\0") if p]
         init_files = [p for p in hits
                       if is_top_level_package(p, import_name)]
@@ -327,12 +330,20 @@ def build_rules(cfg: dict) -> str:
     ]
     floor = cfg["min_auid"]
     ignored = build_ignore_fields(cfg["ignore_uids"])
-    for path in cfg["monitor"]:
+    for path in cfg["monitor_dir"]:
         key = _key_for(path)
         for arch in ("b64", "b32"):
             lines.append(
                 f"-a always,exit -F arch={arch} -S open,openat,openat2 "
                 f"-F dir={path} -F auid>={floor} -F auid!={UNSET_AUID}"
+                f"{ignored} -F key={key}")
+        lines.append("")
+    for path in cfg["monitor_file"]:
+        key = _key_for(path)
+        for arch in ("b64", "b32"):
+            lines.append(
+                f"-a always,exit -F arch={arch} -S open,openat,openat2 "
+                f"-F path={path} -F auid>={floor} -F auid!={UNSET_AUID}"
                 f"{ignored} -F key={key}")
         lines.append("")
     for path, key in cfg["python_watches"]:
@@ -533,18 +544,19 @@ def main(argv=None) -> int:
         return uninstall(args.dry_run, args.no_restart)
 
     cfg = load_config(args.config)
-    configured_monitor = cfg["monitor"]
-    cfg["monitor"] = expand_monitor_paths(configured_monitor, read_mount_points())
-    nested_mounts = [p for p in cfg["monitor"] if p not in configured_monitor]
+    configured_monitor = cfg["monitor_dir"]
+    cfg["monitor_dir"] = expand_monitor_paths(configured_monitor, read_mount_points())
+    nested_mounts = [p for p in cfg["monitor_dir"] if p not in configured_monitor]
 
     python_map = fetch_python_map(cfg["python_map_url"])
     found = resolve_python_watches(python_map)
     cfg["python_watches"], dropped = filter_python_watches(
-        found, cfg["monitor"], cfg["exclude_paths"])
+        found, cfg["monitor_dir"], cfg["exclude_paths"])
 
     print(f"config: {args.config}")
     print(f"  store        = {cfg['store']}")
-    print(f"  monitor      = {configured_monitor}")
+    print(f"  monitor_dir  = {configured_monitor}")
+    print(f"  monitor_file = {cfg['monitor_file'] or 'none'}")
     print(f"  python_map   = {cfg['python_map_url']} "
           f"({len(cfg['python_watches'])} watches / {len(python_map)} modules)")
     if len(cfg["python_watches"]) != len(found):

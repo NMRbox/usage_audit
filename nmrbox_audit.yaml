@@ -1,10 +1,12 @@
 ---
-monitor:
+monitor directories:
   - /reboxitory
   - /usr/software
   - /public
   - /scratch
   - /home/nmrbox
+monitor files:
+  - /usr/bin/R
 store: /accountinglogs/
 min_auid: 30001
 combine seconds: 60
